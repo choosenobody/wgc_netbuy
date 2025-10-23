@@ -1,0 +1,110 @@
+name: Sync WGC CSV from Google Sheet
+on:
+  workflow_dispatch:
+    inputs:
+      sheet_csv_url:
+        description: "可选：覆盖 vars.SHEET_CSV_URL 的 Google Sheet CSV 链接（export?format=csv 或 pub?output=csv）"
+        required: false
+      commit_message:
+        description: "可选：自定义提交信息"
+        required: false
+  schedule:
+    - cron: "0 3 3 * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-wgc
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pandas
+
+      - name: Resolve SHEET_CSV_URL
+        id: cfg
+        env:
+          VAR_URL: ${{ vars.SHEET_CSV_URL }}
+        run: |
+          URL="${{ github.event.inputs.sheet_csv_url }}"
+          if [ -z "$URL" ]; then URL="$VAR_URL"; fi
+          if [ -z "$URL" ]; then
+            echo "::error::SHEET_CSV_URL 未设置。到 Settings→Actions→Variables 添加 vars.SHEET_CSV_URL，或在 Run workflow 时传入 inputs.sheet_csv_url"
+            exit 2
+          fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Using SHEET_CSV_URL=$URL"
+
+      - name: Fetch sheet CSV & normalize
+        env:
+          SHEET_CSV_URL: ${{ steps.cfg.outputs.url }}
+        run: |
+          mkdir -p .bot_state
+          curl -fsSL "$SHEET_CSV_URL" -o /tmp/wgc_sheet.csv
+          python - <<'PY'
+import pandas as pd, sys, re
+import pandas.api.types as pdt
+df = pd.read_csv("/tmp/wgc_sheet.csv")
+def pick_date(df):
+    prefs={"month","date","period","time","month_end","monthend","monthenddate"}
+    for c in df.columns:
+        lc=str(c).lower().replace(" ","")
+        if lc in prefs: return c
+    for c in df.columns:
+        try: pd.to_datetime(df[c], errors="raise"); return c
+        except: pass
+    return None
+def pick_val(df):
+    low={str(c).lower().replace(" ",""): c for c in df.columns}
+    for k in ["netpurchasetons","net_purchase_tons","net","nettons","netcentralbankpurchases","cb_net_buy_tons","value","amount","netbuy","net_buy_tons","purchase_tons"]:
+        if k in low: return low[k]
+    for c in df.columns:
+        if pdt.is_numeric_dtype(df[c]): return c
+    return None
+dcol=pick_date(df); vcol=pick_val(df)
+if not dcol or not vcol:
+    print(f"[FATAL] 无法识别日期/数值列。columns={list(df.columns)}", file=sys.stderr); sys.exit(2)
+def to_num(x):
+    if isinstance(x,str):
+        s=x.strip().replace(",","")
+        if re.match(r"^\(.*\)$", s): s="-"+s.strip("()")
+        try: return float(s)
+        except: return None
+    return x
+out=df[[dcol,vcol]].copy(); out.columns=["Month","NetPurchaseTons"]
+out["Month"]=pd.to_datetime(out["Month"], errors="coerce")
+out["NetPurchaseTons"]=out["NetPurchaseTons"].apply(to_num)
+out=out.dropna().sort_values("Month")[["Month","NetPurchaseTons"]]
+out.to_csv(".bot_state/wgc_netbuy.csv", index=False)
+print("Wrote .bot_state/wgc_netbuy.csv, rows=", len(out))
+PY
+
+      - name: Commit & push if changed
+        env:
+          GIT_AUTHOR_NAME: "wgc-sync-bot"
+          GIT_AUTHOR_EMAIL: "wgc-sync-bot@example.com"
+          GIT_COMMITTER_NAME: "wgc-sync-bot"
+          GIT_COMMITTER_EMAIL: "wgc-sync-bot@example.com"
+        run: |
+          git add .bot_state/wgc_netbuy.csv
+          if git diff --cached --quiet; then
+            echo "No changes."; exit 0
+          fi
+          msg="${{ github.event.inputs.commit_message }}"
+          if [ -z "$msg" ]; then msg="auto: sync WGC CSV from sheet"; fi
+          git commit -m "$msg"
+          git push origin HEAD:${GITHUB_REF_NAME}
